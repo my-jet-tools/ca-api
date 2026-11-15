@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use my_http_server::macros::*;
-use my_http_server::types::FileContent;
 use my_http_server::*;
 
 use crate::app::AppContext;
@@ -34,8 +33,8 @@ async fn handle_request(
     crate::flows::ca::import(
         &action.app,
         &input_data.ca_name,
-        input_data.private_key.content,
-        input_data.cert.content,
+        input_data.private_key.into_vec(),
+        input_data.cert.into_vec(),
     )
     .await?;
 
@@ -48,8 +47,8 @@ pub struct ImportCaInputModel {
     pub ca_name: String,
 
     #[http_form_data(description = "Certificate")]
-    pub cert: FileContent,
+    pub cert: RawData,
 
     #[http_form_data(name = "privateKey", description = "Private key")]
-    pub private_key: FileContent,
+    pub private_key: RawData,
 }

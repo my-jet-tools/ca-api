@@ -4,7 +4,7 @@ on:
     tags: "*"
 
 env:
-  IMAGE_NAME: ghcr.io/myjettools/ca-api
+  IMAGE_NAME: ghcr.io/my-jet-tools/ca-api
 
 jobs:
   build:

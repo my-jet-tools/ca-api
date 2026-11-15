@@ -1,0 +1,11 @@
+{
+    "mcpServers": {
+        "dev-best-practices": {
+            "type": "http",
+            "url": "https://mcp.jetdev.eu/development-TEOP3asBLKQ9IQyI",
+            "headers": {
+                "X-Api-Key": "${MCP_JETDEV_KEY}"
+            }
+        }
+    }
+}

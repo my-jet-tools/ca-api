@@ -5,13 +5,35 @@ Self-contained pure-Rust PKI / CA HTTP service. Generates CA roots, issues and r
 
 ## Configuration
 
-`ca-api` reads a single YAML settings file from `~/.ca-api` (i.e. `/root/.ca-api` in the default Docker container). It has one field:
+`ca-api` reads a single YAML settings file from `~/.ca-api` (i.e. `/root/.ca-api` in the default Docker container):
 
 ```yaml
 config_path: /root/pki
+# optional — also listen for HTTP on this unix socket
+unix_socket: /root/system-sockets/ca-api.http-sock
+# optional — true: listen ONLY on the unix socket, no TCP port 8000
+unix_socket_only: true
 ```
 
-`config_path` is the on-disk root where all CA folders live (see [Storage layout](#storage-layout) below).
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `config_path` | yes | On-disk root where all CA folders live (see [Storage layout](#storage-layout) below) |
+| `unix_socket` | no | Path of a unix socket to serve the same HTTP API on. `~` is expanded. A stale socket file is removed on start |
+| `unix_socket_only` | no | `true` — serve only on `unix_socket`, the TCP port `8000` is not opened. Default `false`. Setting it to `true` without `unix_socket` stops the service at startup |
+
+Listen modes:
+
+| `unix_socket` | `unix_socket_only` | Listens on |
+|---------------|--------------------|------------|
+| not set | not set / `false` | TCP `0.0.0.0:8000` |
+| set | not set / `false` | TCP `0.0.0.0:8000` + unix socket |
+| set | `true` | unix socket only |
+
+Calling the API over the socket:
+
+```bash
+curl --unix-socket ~/unix-sockets/system/ca-api.http-sock http://localhost/api/ca/v1/list
+```
 
 
 ## Docker compose example
@@ -47,6 +69,22 @@ networks:
 ```
 
 Where `./.ca-api` on the host contains the YAML shown in [Configuration](#configuration).
+
+Unix-socket only variant (no TCP port published): drop `ports:`, mount the host socket directory and point `unix_socket` into it:
+
+```yaml
+    volumes:
+      - ./.ca-api:/root/.ca-api
+      - ./pki:/root/pki
+      - ~/unix-sockets/system:/root/system-sockets
+```
+
+```yaml
+# ./.ca-api
+config_path: /root/pki
+unix_socket: /root/system-sockets/ca-api.http-sock
+unix_socket_only: true
+```
 
 
 ## Storage layout

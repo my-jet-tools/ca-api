@@ -12,16 +12,12 @@ pub fn build_controllers(app: &Arc<AppContext>) -> ControllersMiddleware {
         crate::http::controllers::client_certs::GenerateCertificateAction::new(app.clone()),
     ));
 
-    result.register_delete_action(Arc::new(
+    result.register_post_action(Arc::new(
         crate::http::controllers::client_certs::RevokeCertificateAction::new(app.clone()),
     ));
 
-    result.register_get_action(Arc::new(
+    result.register_post_action(Arc::new(
         crate::http::controllers::client_certs::DownloadCertAction::new(app.clone()),
-    ));
-
-    result.register_get_action(Arc::new(
-        crate::http::controllers::client_certs::GetCrlAction::new(app.clone()),
     ));
 
     result.register_get_action(Arc::new(
@@ -51,16 +47,21 @@ pub fn build_controllers(app: &Arc<AppContext>) -> ControllersMiddleware {
         crate::http::controllers::ca::DownloadCertAction::new(app.clone()),
     ));
 
-    result.register_get_action(Arc::new(
-        crate::http::controllers::ca::DownloadRevokedAction::new(app.clone()),
-    ));
-
-    result.register_get_action(Arc::new(
+    result.register_post_action(Arc::new(
         crate::http::controllers::ca::DownloadPrivateKeyAction::new(app.clone()),
     ));
 
     result.register_get_action(Arc::new(
         crate::http::controllers::ca::GetListOfCaAction::new(app.clone()),
+    ));
+
+    // Security
+    result.register_post_action(Arc::new(
+        crate::http::controllers::security::SetNetworkKeyAction::new(app.clone()),
+    ));
+
+    result.register_post_action(Arc::new(
+        crate::http::controllers::security::GetJournalAction::new(app.clone()),
     ));
 
     result

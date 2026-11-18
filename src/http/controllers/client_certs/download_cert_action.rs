@@ -4,16 +4,20 @@ use my_http_server::macros::*;
 use my_http_server::*;
 
 use crate::app::AppContext;
+use crate::flows::CertSelector;
+use crate::http::encryption::{encrypted, request_files_key};
 
 #[http_route(
-    method: "GET",
+    method: "POST",
     route: "/api/certificates/v1/downloadCert",
     summary: "Download client certificate as PKCS#12",
-    description: "Download client certificate as PKCS#12",
+    description: "The certificate `id` — or, with `email` alone, the newest certificate of the email that is not revoked — with its private key and the CA as PKCS#12, protected by the password. The body comes encrypted with the files key (aes128gcm); the answer is encrypted with it. Journaled",
     controller: "Client Certificates",
     input_data: "DownloadClientCertInputModel",
     result:[
-        {status_code: 200, description: "PKCS#12 binary"},
+        {status_code: 200, description: "PKCS#12 binary (application/x-pkcs12), encrypted"},
+        {status_code: 404, description: "No such CA or certificate"},
+        {status_code: 415, description: "The body came in plain"},
     ]
 )]
 pub struct DownloadCertAction {
@@ -25,34 +29,42 @@ impl DownloadCertAction {
         Self { app }
     }
 }
+
 async fn handle_request(
     action: &DownloadCertAction,
     input_data: DownloadClientCertInputModel,
-    _ctx: &HttpContext,
+    ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let result = crate::flows::get_p12(
+    let key = request_files_key(ctx)?;
+    let (selector, email) = CertSelector::of(input_data.id, input_data.email)?;
+    let (_, p12) = crate::flows::get_p12(
         &action.app,
         &input_data.ca_name,
-        &input_data.email,
+        &selector,
+        email.as_deref(),
         &input_data.password,
     )
     .await?;
 
-    let file_name = format!("{}.p12", input_data.email);
-
-    return HttpOutput::as_file(file_name, result)
-        .into_ok_result(true)
-        .into();
+    // No file name in a header: headers are not encrypted, and it would be the email.
+    let builder = HttpResultBuilder::new()
+        .set_status_code(200)
+        .set_content(p12)
+        .set_content_type(WebContentType::Raw("application/x-pkcs12".to_string()));
+    encrypted(builder, &key)
 }
 
 #[derive(MyHttpInput)]
 struct DownloadClientCertInputModel {
-    #[http_query(name = "caName", description = "CA Common Name")]
+    #[http_body(name = "caName", description = "CA Common Name")]
     pub ca_name: String,
 
-    #[http_query(name = "email", description = "Email")]
-    pub email: String,
+    #[http_body(name = "id", description = "The certificate's id (its serial)")]
+    pub id: Option<u64>,
 
-    #[http_query(name = "password", description = "Certificate Password")]
+    #[http_body(name = "email", description = "Without id: the newest certificate of this email that is not revoked. With id: the certificate must be this email's")]
+    pub email: Option<String>,
+
+    #[http_body(name = "password", description = "Certificate Password")]
     pub password: String,
 }

@@ -2,22 +2,21 @@ use std::sync::Arc;
 
 use my_http_server::macros::*;
 use my_http_server::*;
-use serde::Serialize;
 
 use crate::app::AppContext;
+use crate::http::encryption::for_proxy;
 
 #[http_route(
     method: "GET",
     route: "/api/revoked/v1/list",
     summary: "Get List of revoked certificates",
-    description: "Get List of revoked certificates",
+    description: "For my-reverse-proxy, which refuses these certificates: the serials of every certificate the CA revoked, as a YAML array ([] when none), encrypted with the network key (Content-Encoding: aes128gcm, Content-Type: application/yaml)",
     controller: "Client Certificates",
-
     input_data: "GetRevokedCertsInputModel",
-
     result:[
-        {status_code: 200, description: "List of revoked certificates", model: "Vec<RevokedCertHttpModel>"},
-
+        {status_code: 200, description: "The revoked serials as YAML, encrypted with the network key"},
+        {status_code: 404, description: "No such CA"},
+        {status_code: 503, description: "Not initialized yet, or no network key is set"},
     ]
 )]
 pub struct GetListOfRevokedCertificatesAction {
@@ -29,34 +28,18 @@ impl GetListOfRevokedCertificatesAction {
         Self { app }
     }
 }
+
 async fn handle_request(
     action: &GetListOfRevokedCertificatesAction,
     input_data: GetRevokedCertsInputModel,
     _ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let result =
-        crate::flows::get_list_of_revoked_certificates(&action.app, &input_data.ca_name).await;
-
-    let mut http_result = Vec::with_capacity(result.len());
-
-    for item in result {
-        http_result.push(RevokedCertHttpModel {
-            revoked: item.revoked.to_rfc3339(),
-            serial_number: item.serial.to_str_radix(16).to_uppercase(),
-        });
-    }
-    return HttpOutput::as_json(http_result).into_ok_result(true).into();
+    let revoked = crate::flows::revoked_for_proxy(&action.app, &input_data.ca_name).await?;
+    for_proxy(revoked, "application/yaml")
 }
 
 #[derive(MyHttpInput)]
 struct GetRevokedCertsInputModel {
-    #[http_query(name = "caName", description = "Common name")]
+    #[http_query(name = "caName", description = "CA Common Name")]
     pub ca_name: String,
-}
-
-#[derive(Debug, MyHttpObjectStructure, Serialize)]
-
-struct RevokedCertHttpModel {
-    pub revoked: String,
-    pub serial_number: String,
 }

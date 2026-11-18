@@ -2,19 +2,22 @@ use std::sync::Arc;
 
 use my_http_server::macros::*;
 use my_http_server::*;
+use serde_json::json;
 
 use crate::app::AppContext;
+use crate::http::encryption::{encrypted, request_files_key};
 
 #[http_route(
     method: "POST",
     route: "/api/certificates/v1/generate",
     summary: "Generate Client Certificate",
-    description: "Generate Client Certificate",
+    description: "Issue a client certificate (CN = email, RSA-4096, 10 years) — always a new one under a new id: the certificates the email has stay as they are. The body comes encrypted with the files key (aes128gcm); the answer {id, cn} is encrypted with it",
     controller: "Client Certificates",
     input_data: "GenerateCertificateInputModel",
-
     result:[
-        {status_code: 202, description: "Generated Certificate"},
+        {status_code: 200, description: "The id of the new certificate, encrypted"},
+        {status_code: 404, description: "No such CA"},
+        {status_code: 415, description: "The body came in plain"},
     ]
 )]
 pub struct GenerateCertificateAction {
@@ -26,13 +29,18 @@ impl GenerateCertificateAction {
         Self { app }
     }
 }
+
 async fn handle_request(
     action: &GenerateCertificateAction,
     input_data: GenerateCertificateInputModel,
-    _ctx: &HttpContext,
+    ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    crate::flows::generate_cert(&action.app, &input_data.ca_name, &input_data.email).await?;
-    HttpOutput::Empty.into_ok_result(true).into()
+    let key = request_files_key(ctx)?;
+    let id = crate::flows::generate_cert(&action.app, &input_data.ca_name, &input_data.email).await?;
+    encrypted(
+        HttpOutput::as_json(json!({ "id": id, "cn": input_data.email })),
+        &key,
+    )
 }
 
 #[derive(MyHttpInput)]

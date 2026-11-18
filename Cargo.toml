@@ -30,8 +30,19 @@ pem = "*"
 
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
+serde_yaml = "*"
 
-my-tls = { git = "https://github.com/MyJetTools/my-tls.git", tag = "0.1.5" }
 openssl = "*"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 time = "0.3"
+
+# The encrypted state and journal: AES-256-GCM envelopes, as ip-whitelister keeps its data.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+getrandom = "0.3"
+data-encoding = "2"
+
+[dev-dependencies]
+# The end-to-end tests call the API as a client does: encrypted bodies over the unix socket and TCP.
+flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git", features = [
+    "encryption",
+] }

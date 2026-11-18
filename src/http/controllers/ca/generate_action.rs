@@ -5,16 +5,18 @@ use my_http_server::*;
 
 use crate::app::AppContext;
 use crate::flows::PemCertInfo;
+use crate::http::encryption::request_files_key;
 
 #[http_route(
     method: "POST",
     route: "/api/ca/v1/generate",
     summary: "Generate new CA",
-    description: "Generate new CA",
+    description: "Generate new CA. The body comes encrypted with the files key (aes128gcm)",
     controller: "Certificate Authority",
     input_data: "GenerateCaInputModel",
     result:[
         {status_code: 202, description: "CA is generated"},
+        {status_code: 415, description: "The body came in plain"},
     ]
 )]
 pub struct GenerateCaAction {
@@ -26,11 +28,13 @@ impl GenerateCaAction {
         Self { app }
     }
 }
+
 async fn handle_request(
     action: &GenerateCaAction,
     input_data: GenerateCaInputModel,
-    _ctx: &HttpContext,
+    ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
+    request_files_key(ctx)?;
     crate::flows::generate_ca(
         &action.app,
         PemCertInfo {
@@ -42,7 +46,7 @@ async fn handle_request(
     )
     .await?;
 
-    return HttpOutput::Empty.into_ok_result(true).into();
+    HttpOutput::Empty.into_ok_result(true)
 }
 
 #[derive(MyHttpInput)]

@@ -4,17 +4,19 @@ use my_http_server::macros::*;
 use my_http_server::*;
 
 use crate::app::AppContext;
-use crate::flows::FlowError;
+use crate::http::encryption::{encrypted, request_files_key};
 
 #[http_route(
-    method: "GET",
+    method: "POST",
     route: "/api/ca/v1/downloadPk",
     summary: "Download CA private key",
-    description: "Download CA private key",
+    description: "The CA private key as PEM. The body comes encrypted with the files key (aes128gcm); the answer is encrypted with it. Journaled",
     controller: "Certificate Authority",
     input_data: "DownloadCaPrivateKeyInputModel",
     result:[
-        {status_code: 200, description: "CA private key as PEM text"},
+        {status_code: 200, description: "CA private key as PEM, encrypted"},
+        {status_code: 404, description: "No such CA"},
+        {status_code: 415, description: "The body came in plain"},
     ]
 )]
 pub struct DownloadPrivateKeyAction {
@@ -26,25 +28,19 @@ impl DownloadPrivateKeyAction {
         Self { app }
     }
 }
+
 async fn handle_request(
     action: &DownloadPrivateKeyAction,
     input_data: DownloadCaPrivateKeyInputModel,
-    _ctx: &HttpContext,
+    ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let ca_path = action
-        .app
-        .settings
-        .get_config_path()
-        .into_ca_data_path(&input_data.ca_name);
-
-    match tokio::fs::read_to_string(ca_path.to_ca_private_key_file_name()).await {
-        Ok(content) => HttpOutput::as_text(content).into_ok_result(true).into(),
-        Err(_) => Err(FlowError::CaNotFound.into()),
-    }
+    let key = request_files_key(ctx)?;
+    let pem = crate::flows::get_ca_private_key(&action.app, &input_data.ca_name).await?;
+    encrypted(HttpOutput::as_text(pem), &key)
 }
 
 #[derive(MyHttpInput)]
 struct DownloadCaPrivateKeyInputModel {
-    #[http_query(name = "caName", description = "CA Common Name")]
+    #[http_body(name = "caName", description = "CA Common Name")]
     pub ca_name: String,
 }

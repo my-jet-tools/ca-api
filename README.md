@@ -46,6 +46,22 @@ They must differ: `set-network-key` refuses the files key. Holding the network k
 
 Losing the files key loses everything in the data folder: nobody can open it, the service included. Keep it, and back up `data_folder`.
 
+### Changing the files key
+
+`POST /api/change-files-key` `{"newKey"}` swaps the files key for another, in a body encrypted with the current one. Under the hood:
+
+1. The data folder as it is — `state.enc` and the journal, still encrypted with the old key — is copied to `archive/<YYYYMMDDhhmmss>` (UTC; `-2` for a second change within the same second).
+2. A snapshot encrypted with the new key — the state and every journal line — takes its place, and work goes on from it. `POST /api/journal` keeps the whole history.
+3. From then on only the new key opens the folder, after a restart too, and the calls: a call with the old key is refused (`400`). The answer to this call is still encrypted with the old key, the one it came with: `{"changed":true,"archive":"20261119143005","journal_records":120,"journal_unreadable":0}`.
+
+The network key is not touched, and the new key must not be it (`403`). The same key again: `{"changed":false}`, nothing done.
+
+A crash halfway loses nothing: `state.enc` is replaced atomically, and whichever key opens it is the key. If the answer never came, initialize with the new key, and with the old one if the new one is refused. The next `initialize` finishes or drops what the crash left.
+
+**Rolling back.** `POST /api/rollback-files-key` `{"key","archive"?}` puts an archive back — `archive`, or the newest one — with `key`, the files key it is encrypted with, as the files key from then on. It comes as it was then: the state, the journal, the network key of then. What it replaces is archived first, so a rollback is undone the same way: roll back to the newest archive with the key of before. `403` when `key` does not open the archive, `404` when there is no such archive.
+
+**The archives are a risk to weigh.** An archive opens with the key of its time. If the key is changed because it leaked, whoever holds the old key and gets the disk reads the archive: the CAs and their private keys as they were. Once the new key is checked, delete the archive: `POST /api/delete-files-key-archive` `{"archive"}`. `GET /api/files-key-archives` lists them, newest first.
+
 
 ## Initialize
 
@@ -134,6 +150,10 @@ A serial is the certificate's id. my-reverse-proxy refuses a client certificate 
 | ✱ `POST /api/certificates/v1/downloadCert` | `caName`, `id` — or `email` alone, `password` | PKCS#12 (`application/x-pkcs12`): the certificate, its key, the CA. `email` alone: the newest certificate of it that is not revoked. No file name in a header: headers are not encrypted. Journaled |
 | `POST /api/set-network-key` | `networkKey` | `{"set":true,"replaced","changed"}`. Again with another key: a rotation |
 | `POST /api/journal` | `from`?, `to`? (unix seconds, from included, to not), `caName`?, `cn`?, `limit`? (100, at most 1000) | `{"records":[…],"unreadable":0}`, newest first |
+| `POST /api/change-files-key` | `newKey` | `{"changed","archive","journal_records","journal_unreadable"}`, encrypted with the key the call came with. See [Changing the files key](#changing-the-files-key) |
+| `POST /api/rollback-files-key` | `key`, `archive`? | `{"rolled_back":true,"restored","archive"}`: `restored` put back, what it replaced in `archive` |
+| `GET /api/files-key-archives` | — | `["20261119143005", …]`, newest first |
+| `POST /api/delete-files-key-archive` | `archive` | `{"deleted":true}`; 404 when there is no such archive |
 
 - A plain body: `415`. A body the files key does not open: `400` (my-http-server). A replay: `403` (my-http-server), when the sender's clock is more than 10 seconds off the server's, or the body's salt was already accepted. Keep the clocks in sync (NTP).
 - A call with no fields takes `{}`: an empty body cannot be encrypted.
@@ -199,6 +219,8 @@ Order: put the network key into my-reverse-proxy, then `set-network-key` it here
 |---|---|
 | `state.enc` | Every CA with its key, every certificate it issued with its key (kept by id, revoked ones included), the serial counter, the network key: JSON in one envelope with the AAD `state`. Written atomically. |
 | `journal/<yyyy-mm>.log` | The journal of a UTC month: one envelope per line, one record each, with the AAD `journal`. |
+| `archive/<YYYYMMDDhhmmss>/` | `state.enc` and `journal/` as they were before a change of the files key or a rollback: encrypted with the files key of then. Written whole or not at all. |
+| `journal.new/` | Only while the files key changes or a rollback runs: the journal of what takes the place of the folder. A crash leaves it to the next `initialize`, which puts it in place or drops it. |
 
 An envelope is base64 of `nonce (12) ‖ ciphertext ‖ tag (16)`, AES-256-GCM with the files key. Every file is `0600`.
 
@@ -215,6 +237,9 @@ An envelope is base64 of `nonce (12) ‖ ciphertext ‖ tag (16)`, AES-256-GCM w
 | `pfx_downloaded` | `ca`, `cn`, `serial` |
 | `ca_key_downloaded` | `ca` |
 | `network_key_set` | `by` (`new` / `replaced`), never the key |
+| `files_key_changed` | `archive`: where the folder as it was is kept. Never a key |
+| `files_key_rolled_back` | `restored`: the archive put back; `archive`: where what it replaced is kept |
+| `archive_deleted` | `archive` |
 
 Old months are files of their own: delete `journal/<yyyy-mm>.log` to drop one.
 

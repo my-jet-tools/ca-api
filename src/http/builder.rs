@@ -64,5 +64,21 @@ pub fn build_controllers(app: &Arc<AppContext>) -> ControllersMiddleware {
         crate::http::controllers::security::GetJournalAction::new(app.clone()),
     ));
 
+    result.register_post_action(Arc::new(
+        crate::http::controllers::security::ChangeFilesKeyAction::new(app.clone()),
+    ));
+
+    result.register_post_action(Arc::new(
+        crate::http::controllers::security::RollBackFilesKeyAction::new(app.clone()),
+    ));
+
+    result.register_get_action(Arc::new(
+        crate::http::controllers::security::FilesKeyArchivesAction::new(app.clone()),
+    ));
+
+    result.register_post_action(Arc::new(
+        crate::http::controllers::security::DeleteFilesKeyArchiveAction::new(app.clone()),
+    ));
+
     result
 }

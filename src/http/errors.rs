@@ -23,6 +23,7 @@ impl From<FlowError> for HttpFailResult {
             FlowError::CertAlreadyRevoked => {
                 Self::from((409u16, "The certificate is revoked already"))
             }
+            FlowError::ArchiveNotFound => Self::as_not_found("Archive not found".to_string(), false),
             FlowError::ValidationError(err) => Self::as_forbidden(err.into()),
             FlowError::SomethingWentWrong(err) => Self::as_fatal_error(err),
         }

@@ -4,6 +4,7 @@
 mod ca;
 mod certs;
 mod error;
+mod files_key;
 mod journal;
 mod network_key;
 mod proxy;
@@ -11,6 +12,7 @@ mod proxy;
 pub use ca::*;
 pub use certs::*;
 pub use error::*;
+pub use files_key::*;
 pub use journal::*;
 pub use network_key::*;
 pub use proxy::*;

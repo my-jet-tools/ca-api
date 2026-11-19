@@ -11,6 +11,8 @@ pub enum FlowError {
     CertNotFound,
     /// The certificate with this id is revoked already.
     CertAlreadyRevoked,
+    /// There is no archive of the data folder with this id — or none at all.
+    ArchiveNotFound,
     ValidationError(String),
     SomethingWentWrong(String),
 }

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 
-use super::data_folder::{DataFolder, UnlockError};
+use super::data_folder::{ArchiveError, DataFolder, Rekeyed, UnlockError};
 use super::journal::{unix_now, JournalEvent, JournalPage, JournalQuery, JournalRecord};
 use super::legacy::read_legacy_pki;
 use super::state_model::StateModel;
@@ -61,6 +61,47 @@ impl std::fmt::Display for InitializeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotInitialized;
 
+/// What [`Opened::change_key`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesKeyChange {
+    /// It already was this key: nothing was done.
+    Unchanged,
+    /// Everything is encrypted with the new key now; what it was, with the old key, is in
+    /// `archive`.
+    Changed { archive: String, rekeyed: Rekeyed },
+}
+
+/// What [`Opened::roll_back`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolledBack {
+    /// The archive that was put back.
+    pub restored: String,
+    /// Where what it replaced is kept, with the key of then.
+    pub archive: String,
+    /// Why the journal of the archive is not in place yet, if it is not.
+    pub pending: Option<String>,
+}
+
+/// Why [`Opened::roll_back`] did nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollBackError {
+    /// There is no archive with this id — or none at all.
+    NotFound,
+    /// The key does not open the archive.
+    WrongKey,
+    Failed(String),
+}
+
+impl From<ArchiveError> for RollBackError {
+    fn from(value: ArchiveError) -> Self {
+        match value {
+            ArchiveError::NotFound => Self::NotFound,
+            ArchiveError::WrongKey => Self::WrongKey,
+            ArchiveError::Failed(e) => Self::Failed(e),
+        }
+    }
+}
+
 /// The opened data folder and the state it holds.
 pub struct Opened {
     folder: DataFolder,
@@ -96,6 +137,59 @@ impl Opened {
     /// Whether `key` is the key the data folder is encrypted with.
     pub fn is_files_key(&self, key: &Key) -> bool {
         self.key == *key
+    }
+
+    /// Archive what the data folder holds, with the key it has, and take its place with a
+    /// snapshot encrypted with `new_key` — the state and every journal line — which becomes the
+    /// files key: after a restart only it opens the folder. An error means nothing changed: the
+    /// folder keeps the key it had.
+    pub fn change_key(&mut self, new_key: &Key) -> Result<FilesKeyChange, String> {
+        if self.key == *new_key {
+            return Ok(FilesKeyChange::Unchanged);
+        }
+        let archive = self.folder.archive()?;
+        let rekeyed = self.folder.rekey(new_key, &self.state)?;
+        self.key = *new_key;
+        Ok(FilesKeyChange::Changed { archive, rekeyed })
+    }
+
+    /// Put the archive `id` back — the newest one when `None` — once `key` opens it: its state,
+    /// its journal, and its key as the files key. What it replaces is archived first, so a
+    /// rollback is undone the same way. An error means nothing changed.
+    pub fn roll_back(&mut self, id: Option<&str>, key: &Key) -> Result<RolledBack, RollBackError> {
+        let restored = match id {
+            Some(id) => id.to_string(),
+            None => self
+                .folder
+                .archives()
+                .map_err(RollBackError::Failed)?
+                .into_iter()
+                .next()
+                .ok_or(RollBackError::NotFound)?,
+        };
+        let archived = self.folder.open_archive(&restored, key)?;
+        let archive = self.folder.archive().map_err(RollBackError::Failed)?;
+        let (state, pending) = self
+            .folder
+            .install(archived)
+            .map_err(RollBackError::Failed)?;
+        self.key = *key;
+        self.state = state;
+        Ok(RolledBack {
+            restored,
+            archive,
+            pending,
+        })
+    }
+
+    /// The ids of the archives, newest first.
+    pub fn archives(&self) -> Result<Vec<String>, String> {
+        self.folder.archives()
+    }
+
+    /// Delete the archive `id`: `false` when there is none.
+    pub fn delete_archive(&self, id: &str) -> Result<bool, String> {
+        self.folder.delete_archive(id)
     }
 }
 
@@ -158,6 +252,12 @@ impl SecureStorage {
                         UnlockError::WrongKey => InitializeError::WrongKey,
                         UnlockError::Failed(e) => InitializeError::Failed(e),
                     })?;
+                // A change of the key the process did not live to finish: finished, or dropped.
+                if let Err(e) = data_folder.finish_rekey() {
+                    crate::log::warn(format!(
+                        "The journal written again with the new files key is not in place yet: {e}"
+                    ));
+                }
                 data_folder.append_or_warn(JournalRecord::new(JournalEvent::Unlocked, unix_now()));
                 (data_folder, state, key, false, None, None)
             } else {
@@ -249,7 +349,7 @@ impl DataFolder {
 
 #[cfg(test)]
 mod tests {
-    use super::{InitializeError, SecureStorage};
+    use super::{FilesKeyChange, InitializeError, RollBackError, SecureStorage};
     use crate::crypto::envelope::{encode_key, generate_key};
     use crate::storage::data_folder::tests::Folder;
     use crate::storage::journal::{JournalEvent, JournalQuery};
@@ -299,6 +399,74 @@ mod tests {
             .iter()
             .map(|r| r.event)
             .collect();
+        assert_eq!(events, [JournalEvent::Unlocked, JournalEvent::Initialized]);
+    }
+
+    #[tokio::test]
+    async fn the_files_key_is_changed_and_rolled_back_and_the_rollback_is_undone() {
+        let data = Folder::new();
+        let (old, new) = (generate_key().unwrap(), generate_key().unwrap());
+        let (old_text, new_text) = (encode_key(&old), encode_key(&new));
+
+        let storage = SecureStorage::new(data.0.clone(), None);
+        storage.initialize(Some(&old_text)).await.unwrap();
+        let mut opened = storage.lock().await.unwrap();
+        let FilesKeyChange::Changed { archive, rekeyed } = opened.change_key(&new).unwrap() else {
+            panic!("not changed");
+        };
+        assert_eq!((rekeyed.records, rekeyed.pending), (1, None));
+        assert!(opened.is_files_key(&new) && !opened.is_files_key(&old));
+        assert_eq!(opened.change_key(&new).unwrap(), FilesKeyChange::Unchanged);
+        assert_eq!(opened.archives().unwrap(), std::slice::from_ref(&archive));
+        drop(opened);
+
+        // After a restart only the new key opens the folder.
+        let storage = SecureStorage::new(data.0.clone(), None);
+        assert_eq!(
+            storage.initialize(Some(&old_text)).await.unwrap_err(),
+            InitializeError::WrongKey
+        );
+        storage.initialize(Some(&new_text)).await.unwrap();
+
+        let mut opened = storage.lock().await.unwrap();
+        assert_eq!(
+            opened.roll_back(None, &new).unwrap_err(),
+            RollBackError::WrongKey
+        );
+        assert_eq!(
+            opened.roll_back(Some("20000101000000"), &old).unwrap_err(),
+            RollBackError::NotFound
+        );
+        let rolled_back = opened.roll_back(None, &old).unwrap();
+        assert_eq!(rolled_back.restored, archive);
+        assert!(opened.is_files_key(&old));
+        assert_eq!(
+            opened.archives().unwrap(),
+            [rolled_back.archive.clone(), archive.clone()]
+        );
+        drop(opened);
+
+        let storage = SecureStorage::new(data.0.clone(), None);
+        assert_eq!(
+            storage.initialize(Some(&new_text)).await.unwrap_err(),
+            InitializeError::WrongKey
+        );
+        storage.initialize(Some(&old_text)).await.unwrap();
+
+        // The rollback is undone the same way: its archive, with the new key.
+        let mut opened = storage.lock().await.unwrap();
+        let undone = opened.roll_back(None, &new).unwrap();
+        assert_eq!(undone.restored, rolled_back.archive);
+        assert!(opened.is_files_key(&new));
+        let events: Vec<JournalEvent> = opened
+            .read_journal(&JournalQuery::default())
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| r.event)
+            .collect();
+        // The journal of the archive of the rollback: as it was then — created, and unlocked once
+        // with the new key. The unlock with the old key since is in the folder it replaced.
         assert_eq!(events, [JournalEvent::Unlocked, JournalEvent::Initialized]);
     }
 

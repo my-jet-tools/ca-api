@@ -43,6 +43,14 @@ pub enum JournalEvent {
     /// The network key was set, `by` `new` or `replaced` (a rotation). The key itself is never
     /// journaled.
     NetworkKeySet,
+    /// The files key was changed: the data folder is a snapshot with the new key, and what it was
+    /// is in `archive`, with the old key. No key is ever journaled.
+    FilesKeyChanged,
+    /// The archive `restored` was put back, with its key as the files key; what it replaced is
+    /// in `archive`.
+    FilesKeyRolledBack,
+    /// The archive `archive` was deleted.
+    ArchiveDeleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +69,12 @@ pub struct JournalRecord {
     /// How many certificate records came with an imported CA.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificates: Option<usize>,
+    /// The archive the event made or deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
+    /// The archive a rollback put back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<String>,
 }
 
 impl JournalRecord {
@@ -74,7 +88,16 @@ impl JournalRecord {
             serial: None,
             by: None,
             certificates: None,
+            archive: None,
+            restored: None,
         }
+    }
+
+    /// A record of `event` now, about the archive `archive`.
+    pub fn of_archive(event: JournalEvent, archive: &str) -> Self {
+        let mut record = Self::new(event, unix_now());
+        record.archive = Some(archive.to_string());
+        record
     }
 
     /// A record of `event` now, about `ca`.

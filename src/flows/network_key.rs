@@ -15,15 +15,18 @@ pub enum NetworkKeySet {
     Unchanged,
 }
 
-/// Keep `raw` (base64 of 32 bytes) in the state as the network key: what the answers to
-/// my-reverse-proxy are encrypted with. Never the files key: my-reverse-proxy holds the network
-/// key, and with the files key it would hold everything.
+/// Keep `raw` (base64 of 32 bytes) in the state as the network key: the key of every encrypted
+/// call but setting the network key and changing the encryption key, and what the answers to
+/// my-reverse-proxy are encrypted with. From the next request on the calls take it, and no other
+/// network key. Never the encryption key: my-reverse-proxy holds the network key, and with the
+/// encryption key it would hold the data folder.
 pub async fn set_network_key(app: &AppContext, raw: &str) -> Result<NetworkKeySet, FlowError> {
     let key = decode_key(raw).map_err(|e| FlowError::ValidationError(format!("networkKey: {e}")))?;
     let mut opened = app.storage.lock().await?;
-    if opened.is_files_key(&key) {
+    if opened.encryption_key() == &key {
         return Err(FlowError::ValidationError(
-            "networkKey must not be the files key: my-reverse-proxy holds the network key".to_string(),
+            "networkKey must not be the encryption key: my-reverse-proxy holds the network key"
+                .to_string(),
         ));
     }
     let result = match opened.state().network_key.as_deref().map(decode_key) {
@@ -36,6 +39,8 @@ pub async fn set_network_key(app: &AppContext, raw: &str) -> Result<NetworkKeySe
     opened
         .commit(state)
         .map_err(FlowError::SomethingWentWrong)?;
+    // Still under the lock of the state: from the next request on, the new network key alone.
+    app.refresh_call_keys(&opened);
     let mut record = JournalRecord::new(JournalEvent::NetworkKeySet, unix_now());
     record.by = Some(
         match result {

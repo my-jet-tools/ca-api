@@ -4,13 +4,13 @@ use my_http_server::macros::*;
 use my_http_server::*;
 
 use crate::app::AppContext;
-use crate::http::encryption::{encrypted, request_files_key};
+use crate::http::encryption::{encrypted, request_network_key};
 
 #[http_route(
     method: "POST",
     route: "/api/ca/v1/check",
     summary: "Check CA exists",
-    description: "Check CA exists. The body comes encrypted with the files key (aes128gcm); the answer is encrypted with it",
+    description: "Check CA exists. The body comes encrypted with the network key (aes128gcm); the answer is encrypted with it",
     controller: "Certificate Authority",
     input_data: "CheckCaCertificateInputModel",
     result:[
@@ -34,7 +34,7 @@ async fn handle_request(
     input_data: CheckCaCertificateInputModel,
     ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let key = request_files_key(ctx)?;
+    let key = request_network_key(&action.app, ctx)?;
     crate::flows::check_ca(&action.app, &input_data.ca_name).await?;
     encrypted(HttpOutput::as_text("Ok".to_string()), &key)
 }

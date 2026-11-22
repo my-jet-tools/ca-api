@@ -4,13 +4,13 @@ use my_http_server::macros::*;
 use my_http_server::*;
 
 use crate::app::AppContext;
-use crate::http::encryption::{encrypted, request_files_key};
+use crate::http::encryption::{encrypted, request_network_key};
 
 #[http_route(
     method: "POST",
     route: "/api/ca/v1/downloadPk",
     summary: "Download CA private key",
-    description: "The CA private key as PEM. The body comes encrypted with the files key (aes128gcm); the answer is encrypted with it. Journaled",
+    description: "The CA private key as PEM. The body comes encrypted with the network key (aes128gcm); the answer is encrypted with it. Journaled",
     controller: "Certificate Authority",
     input_data: "DownloadCaPrivateKeyInputModel",
     result:[
@@ -34,7 +34,7 @@ async fn handle_request(
     input_data: DownloadCaPrivateKeyInputModel,
     ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let key = request_files_key(ctx)?;
+    let key = request_network_key(&action.app, ctx)?;
     let pem = crate::flows::get_ca_private_key(&action.app, &input_data.ca_name).await?;
     encrypted(HttpOutput::as_text(pem), &key)
 }

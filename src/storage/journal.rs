@@ -43,13 +43,17 @@ pub enum JournalEvent {
     /// The network key was set, `by` `new` or `replaced` (a rotation). The key itself is never
     /// journaled.
     NetworkKeySet,
-    /// The files key was changed: the data folder is a snapshot with the new key, and what it was
-    /// is in `archive`, with the old key. No key is ever journaled.
-    FilesKeyChanged,
-    /// The archive `restored` was put back, with its key as the files key; what it replaced is
-    /// in `archive`.
-    FilesKeyRolledBack,
-    /// The archive `archive` was deleted.
+    /// The encryption key was changed: the data folder is a snapshot under the new key, and what
+    /// was in place is in `archive`, under the old key. No key is ever journaled. (`files_key_changed`
+    /// in 0.3.)
+    #[serde(alias = "files_key_changed")]
+    KeyChanged,
+    /// The archive `restored` was put back, with its key as the encryption key; what was in place
+    /// is in `archive`. (`files_key_rolled_back` in 0.3.)
+    #[serde(alias = "files_key_rolled_back")]
+    RolledBack,
+    /// 0.3 only, which deleted archives over the API: the archive `archive` was deleted. Read,
+    /// never written any more.
     ArchiveDeleted,
 }
 

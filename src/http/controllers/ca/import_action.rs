@@ -4,13 +4,13 @@ use my_http_server::macros::*;
 use my_http_server::*;
 
 use crate::app::AppContext;
-use crate::http::encryption::request_files_key;
+use crate::http::encryption::request_network_key;
 
 #[http_route(
     method: "POST",
     route: "/api/ca/v1/import",
     summary: "Import existing CA",
-    description: "Import existing CA. The multipart body comes encrypted with the files key (aes128gcm)",
+    description: "Import existing CA. The multipart body comes encrypted with the network key (aes128gcm)",
     controller: "Certificate Authority",
     input_data: "ImportCaInputModel",
     result:[
@@ -33,7 +33,7 @@ async fn handle_request(
     input_data: ImportCaInputModel,
     ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    request_files_key(ctx)?;
+    request_network_key(&action.app, ctx)?;
     crate::flows::import_ca(
         &action.app,
         &input_data.ca_name,

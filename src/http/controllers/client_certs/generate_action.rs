@@ -5,13 +5,13 @@ use my_http_server::*;
 use serde_json::json;
 
 use crate::app::AppContext;
-use crate::http::encryption::{encrypted, request_files_key};
+use crate::http::encryption::{encrypted, request_network_key};
 
 #[http_route(
     method: "POST",
     route: "/api/certificates/v1/generate",
     summary: "Generate Client Certificate",
-    description: "Issue a client certificate (CN = email, RSA-4096, 10 years) — always a new one under a new id: the certificates the email has stay as they are. The body comes encrypted with the files key (aes128gcm); the answer {id, cn} is encrypted with it",
+    description: "Issue a client certificate (CN = email, RSA-4096, 10 years) — always a new one under a new id: the certificates the email has stay as they are. The body comes encrypted with the network key (aes128gcm); the answer {id, cn} is encrypted with it",
     controller: "Client Certificates",
     input_data: "GenerateCertificateInputModel",
     result:[
@@ -35,7 +35,7 @@ async fn handle_request(
     input_data: GenerateCertificateInputModel,
     ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let key = request_files_key(ctx)?;
+    let key = request_network_key(&action.app, ctx)?;
     let id = crate::flows::generate_cert(&action.app, &input_data.ca_name, &input_data.email).await?;
     encrypted(
         HttpOutput::as_json(json!({ "id": id, "cn": input_data.email })),

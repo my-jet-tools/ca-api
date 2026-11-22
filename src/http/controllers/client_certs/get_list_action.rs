@@ -6,13 +6,13 @@ use serde::*;
 
 use crate::app::AppContext;
 use crate::flows::IssuedCertificateInfo;
-use crate::http::encryption::{encrypted, files_key};
+use crate::http::encryption::{encrypted, network_key};
 
 #[http_route(
     method: "GET",
     route: "/api/certificates/v1/list",
     summary: "Get list of certificates",
-    description: "Every certificate the CA issued, revoked ones included, as JSON [{id, cn, revoked, issued_at, revoked_at}] encrypted with the files key (aes128gcm). The id is the serial; an email may have several certificates",
+    description: "Every certificate the CA issued, revoked ones included, as JSON [{id, cn, revoked, issued_at, revoked_at}] encrypted with the network key (aes128gcm). The id is the serial; an email may have several certificates",
     controller: "Client Certificates",
     input_data: "GetListInputModel",
     result:[
@@ -34,7 +34,7 @@ async fn handle_request(
     input_data: GetListInputModel,
     _ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let key = files_key(&action.app)?;
+    let key = network_key(&action.app)?;
     let result =
         crate::flows::list_issued_certificates(&action.app, &input_data.ca_name).await?;
     let response: Vec<IssuedCertificateHttpModel> = result.into_iter().map(|x| x.into()).collect();

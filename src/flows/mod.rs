@@ -3,16 +3,16 @@
 
 mod ca;
 mod certs;
+mod encryption_key;
 mod error;
-mod files_key;
 mod journal;
 mod network_key;
 mod proxy;
 
 pub use ca::*;
 pub use certs::*;
+pub use encryption_key::*;
 pub use error::*;
-pub use files_key::*;
 pub use journal::*;
 pub use network_key::*;
 pub use proxy::*;

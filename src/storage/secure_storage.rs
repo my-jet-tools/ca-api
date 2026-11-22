@@ -63,7 +63,7 @@ pub struct NotInitialized;
 
 /// What [`Opened::change_key`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FilesKeyChange {
+pub enum KeyChange {
     /// It already was this key: nothing was done.
     Unchanged,
     /// Everything is encrypted with the new key now; what it was, with the old key, is in
@@ -76,30 +76,20 @@ pub enum FilesKeyChange {
 pub struct RolledBack {
     /// The archive that was put back.
     pub restored: String,
-    /// Where what it replaced is kept, with the key of then.
+    /// Where what was in place went, under its key.
     pub archive: String,
-    /// Why the journal of the archive is not in place yet, if it is not.
+    /// Why the journal put back is not in place yet, if it is not: the next start puts it there.
     pub pending: Option<String>,
 }
 
 /// Why [`Opened::roll_back`] did nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RollBackError {
-    /// There is no archive with this id — or none at all.
-    NotFound,
-    /// The key does not open the archive.
-    WrongKey,
+    /// There is no archive with this name.
+    NoSuchArchive,
+    /// The key opens no archive — or not the one named.
+    NoArchiveOpens,
     Failed(String),
-}
-
-impl From<ArchiveError> for RollBackError {
-    fn from(value: ArchiveError) -> Self {
-        match value {
-            ArchiveError::NotFound => Self::NotFound,
-            ArchiveError::WrongKey => Self::WrongKey,
-            ArchiveError::Failed(e) => Self::Failed(e),
-        }
-    }
 }
 
 /// The opened data folder and the state it holds.
@@ -134,63 +124,62 @@ impl Opened {
         self.folder.read_journal(query)
     }
 
-    /// Whether `key` is the key the data folder is encrypted with.
-    pub fn is_files_key(&self, key: &Key) -> bool {
-        self.key == *key
+    /// The encryption key: what the data folder is encrypted with.
+    pub fn encryption_key(&self) -> &Key {
+        &self.key
     }
 
-    /// Archive what the data folder holds, with the key it has, and take its place with a
+    /// The network key of the state, when it has one.
+    pub fn network_key(&self) -> Option<Key> {
+        let network_key = self.state.network_key.as_deref()?;
+        envelope::decode_key(network_key).ok()
+    }
+
+    /// Archive what the data folder holds, under the key it has, and take its place with a
     /// snapshot encrypted with `new_key` — the state and every journal line — which becomes the
-    /// files key: after a restart only it opens the folder. An error means nothing changed: the
-    /// folder keeps the key it had.
-    pub fn change_key(&mut self, new_key: &Key) -> Result<FilesKeyChange, String> {
+    /// encryption key: after a restart only it opens the folder. An error means nothing changed:
+    /// the folder keeps the key it had.
+    pub fn change_key(&mut self, new_key: &Key) -> Result<KeyChange, String> {
         if self.key == *new_key {
-            return Ok(FilesKeyChange::Unchanged);
+            return Ok(KeyChange::Unchanged);
         }
         let archive = self.folder.archive()?;
         let rekeyed = self.folder.rekey(new_key, &self.state)?;
         self.key = *new_key;
-        Ok(FilesKeyChange::Changed { archive, rekeyed })
+        Ok(KeyChange::Changed { archive, rekeyed })
     }
 
-    /// Put the archive `id` back — the newest one when `None` — once `key` opens it: its state,
-    /// its journal, and its key as the files key. What it replaces is archived first, so a
-    /// rollback is undone the same way. An error means nothing changed.
-    pub fn roll_back(&mut self, id: Option<&str>, key: &Key) -> Result<RolledBack, RollBackError> {
-        let restored = match id {
-            Some(id) => id.to_string(),
-            None => self
-                .folder
-                .archives()
-                .map_err(RollBackError::Failed)?
-                .into_iter()
-                .next()
-                .ok_or(RollBackError::NotFound)?,
-        };
-        let archived = self.folder.open_archive(&restored, key)?;
-        let archive = self.folder.archive().map_err(RollBackError::Failed)?;
-        let (state, pending) = self
-            .folder
-            .install(archived)
-            .map_err(RollBackError::Failed)?;
+    /// Put the archive `archive` back — with none named, the newest archive `key` opens — and
+    /// make `key` the encryption key. What is in place is archived first, under its key, so a
+    /// rollback loses nothing and is rolled back the same way. An error means nothing changed.
+    pub fn roll_back(
+        &mut self,
+        key: &Key,
+        archive: Option<&str>,
+    ) -> Result<RolledBack, RollBackError> {
+        let rolled = self.folder.roll_back(key, archive).map_err(|e| match e {
+            ArchiveError::NotFound => RollBackError::NoSuchArchive,
+            ArchiveError::WrongKey | ArchiveError::NoneOpens => RollBackError::NoArchiveOpens,
+            ArchiveError::Failed(e) => RollBackError::Failed(e),
+        })?;
         self.key = *key;
-        self.state = state;
+        self.state = rolled.state;
         Ok(RolledBack {
-            restored,
-            archive,
-            pending,
+            restored: rolled.restored,
+            archive: rolled.archive,
+            pending: rolled.pending,
         })
     }
+}
 
-    /// The ids of the archives, newest first.
-    pub fn archives(&self) -> Result<Vec<String>, String> {
-        self.folder.archives()
-    }
-
-    /// Delete the archive `id`: `false` when there is none.
-    pub fn delete_archive(&self, id: &str) -> Result<bool, String> {
-        self.folder.delete_archive(id)
-    }
+/// A data folder opened, about to become [`Opened`].
+struct Opening {
+    folder: DataFolder,
+    key: Key,
+    state: StateModel,
+    created: bool,
+    generated_key: Option<String>,
+    imported: Option<(usize, usize)>,
 }
 
 pub struct SecureStorage {
@@ -222,8 +211,8 @@ impl SecureStorage {
             .map_err(|_| NotInitialized)
     }
 
-    /// Hand the service its key (base64 of 32 bytes), once per start. Returns what was done, and
-    /// the key — for the encrypted calls.
+    /// Hand the service its encryption key (base64 of 32 bytes), once per start. Returns what was
+    /// done, and the key.
     ///
     /// - A data folder with a state: `key` must open it.
     /// - Without one: the state is created, encrypted with `key` — or with a key made now when
@@ -239,89 +228,106 @@ impl SecureStorage {
         let folder = self.data_folder.as_str();
         let key_text = key.map(str::trim).filter(|key| !key.is_empty());
 
-        let (data_folder, state, key, created, generated_key, imported) =
-            if DataFolder::has_state(folder) {
-                let Some(key_text) = key_text else {
-                    return Err(InitializeError::BadKey(
-                        "the data folder has a state: the key that opens it is needed".to_string(),
-                    ));
-                };
-                let key = envelope::decode_key(key_text).map_err(InitializeError::BadKey)?;
-                let (data_folder, state) =
-                    DataFolder::unlock(folder, &key).map_err(|e| match e {
-                        UnlockError::WrongKey => InitializeError::WrongKey,
-                        UnlockError::Failed(e) => InitializeError::Failed(e),
-                    })?;
-                // A change of the key the process did not live to finish: finished, or dropped.
-                if let Err(e) = data_folder.finish_rekey() {
-                    crate::log::warn(format!(
-                        "The journal written again with the new files key is not in place yet: {e}"
-                    ));
-                }
-                data_folder.append_or_warn(JournalRecord::new(JournalEvent::Unlocked, unix_now()));
-                (data_folder, state, key, false, None, None)
-            } else {
-                let (key, generated_key) = match key_text {
-                    Some(key_text) => (
-                        envelope::decode_key(key_text).map_err(InitializeError::BadKey)?,
-                        None,
-                    ),
-                    None => {
-                        let key = envelope::generate_key().map_err(InitializeError::Failed)?;
-                        (key, Some(envelope::encode_key(&key)))
-                    }
-                };
-                let mut state = StateModel::default();
-                if let Some(legacy) = self.legacy_pki.as_deref() {
-                    state.cas = read_legacy_pki(legacy).map_err(|e| {
-                        InitializeError::Failed(format!(
-                            "the plaintext PKI folder cannot be imported: {e}"
-                        ))
-                    })?;
-                }
-                let data_folder =
-                    DataFolder::create(folder, &key, &state).map_err(InitializeError::Failed)?;
-                let now = unix_now();
-                data_folder.append_or_warn(JournalRecord::new(JournalEvent::Initialized, now));
-                let mut imported = None;
-                if !state.cas.is_empty() {
-                    let mut certificates = 0;
-                    for (name, ca) in &state.cas {
-                        let mut record = JournalRecord::new(JournalEvent::CaImported, now);
-                        record.ca = Some(name.clone());
-                        record.by = Some("legacy".to_string());
-                        record.certificates = Some(ca.certificates.len());
-                        data_folder.append_or_warn(record);
-                        certificates += ca.certificates.len();
-                    }
-                    imported = Some((state.cas.len(), certificates));
-                }
-                (data_folder, state, key, true, generated_key, imported)
+        let opening = if DataFolder::has_state(folder) {
+            let Some(key_text) = key_text else {
+                return Err(InitializeError::BadKey(
+                    "the data folder has a state: the key that opens it is needed".to_string(),
+                ));
             };
+            let key = envelope::decode_key(key_text).map_err(InitializeError::BadKey)?;
+            let (data_folder, state) = DataFolder::unlock(folder, &key).map_err(|e| match e {
+                UnlockError::WrongKey => InitializeError::WrongKey,
+                UnlockError::Failed(e) => InitializeError::Failed(e),
+            })?;
+            // A change of the key the process did not live to finish: finished, or dropped.
+            if let Err(e) = data_folder.finish_rekey() {
+                crate::log::warn(format!(
+                    "The journal written again with the new encryption key is not in place yet: {e}"
+                ));
+            }
+            data_folder.append_or_warn(JournalRecord::new(JournalEvent::Unlocked, unix_now()));
+            Opening {
+                folder: data_folder,
+                key,
+                state,
+                created: false,
+                generated_key: None,
+                imported: None,
+            }
+        } else {
+            let (key, generated_key) = match key_text {
+                Some(key_text) => (
+                    envelope::decode_key(key_text).map_err(InitializeError::BadKey)?,
+                    None,
+                ),
+                None => {
+                    let key = envelope::generate_key().map_err(InitializeError::Failed)?;
+                    (key, Some(envelope::encode_key(&key)))
+                }
+            };
+            let mut state = StateModel::default();
+            if let Some(legacy) = self.legacy_pki.as_deref() {
+                state.cas = read_legacy_pki(legacy).map_err(|e| {
+                    InitializeError::Failed(format!(
+                        "the plaintext PKI folder cannot be imported: {e}"
+                    ))
+                })?;
+            }
+            let data_folder =
+                DataFolder::create(folder, &key, &state).map_err(InitializeError::Failed)?;
+            let now = unix_now();
+            data_folder.append_or_warn(JournalRecord::new(JournalEvent::Initialized, now));
+            let mut imported = None;
+            if !state.cas.is_empty() {
+                let mut certificates = 0;
+                for (name, ca) in &state.cas {
+                    let mut record = JournalRecord::new(JournalEvent::CaImported, now);
+                    record.ca = Some(name.clone());
+                    record.by = Some("legacy".to_string());
+                    record.certificates = Some(ca.certificates.len());
+                    data_folder.append_or_warn(record);
+                    certificates += ca.certificates.len();
+                }
+                imported = Some((state.cas.len(), certificates));
+            }
+            Opening {
+                folder: data_folder,
+                key,
+                state,
+                created: true,
+                generated_key,
+                imported,
+            }
+        };
+        let key = opening.key;
+        Ok((self.open(&mut opened, opening), key))
+    }
 
-        let sweep = data_folder.sweep();
+    /// Sweep the folder `opening` opened and make it the opened one.
+    fn open(&self, slot: &mut Option<Opened>, opening: Opening) -> Initialized {
+        let sweep = opening.folder.sweep();
         for failed in &sweep.failed {
             crate::log::warn(format!(
                 "Not deleted from the data folder, as not encrypted: {failed}"
             ));
         }
-
+        let state = &opening.state;
         let done = Initialized {
-            created,
-            generated_key,
+            created: opening.created,
+            generated_key: opening.generated_key,
             cas: state.cas.len(),
             certificates: state.cas.values().map(|ca| ca.certificates.len()).sum(),
-            imported,
+            imported: opening.imported,
             network_key: state.network_key.is_some(),
             deleted: sweep.deleted,
         };
-        *opened = Some(Opened {
-            folder: data_folder,
-            key,
-            state,
+        *slot = Some(Opened {
+            folder: opening.folder,
+            key: opening.key,
+            state: opening.state,
         });
         self.initialized.store(true, Ordering::SeqCst);
-        Ok((done, key))
+        done
     }
 
     /// Whether the plaintext folder of 0.2 still holds a CA: then its keys are still readable on
@@ -349,7 +355,7 @@ impl DataFolder {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesKeyChange, InitializeError, RollBackError, SecureStorage};
+    use super::{InitializeError, KeyChange, RollBackError, SecureStorage};
     use crate::crypto::envelope::{encode_key, generate_key};
     use crate::storage::data_folder::tests::Folder;
     use crate::storage::journal::{JournalEvent, JournalQuery};
@@ -403,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_files_key_is_changed_and_rolled_back_and_the_rollback_is_undone() {
+    async fn the_encryption_key_is_changed_and_rolled_back_and_the_rollback_is_undone() {
         let data = Folder::new();
         let (old, new) = (generate_key().unwrap(), generate_key().unwrap());
         let (old_text, new_text) = (encode_key(&old), encode_key(&new));
@@ -411,13 +417,12 @@ mod tests {
         let storage = SecureStorage::new(data.0.clone(), None);
         storage.initialize(Some(&old_text)).await.unwrap();
         let mut opened = storage.lock().await.unwrap();
-        let FilesKeyChange::Changed { archive, rekeyed } = opened.change_key(&new).unwrap() else {
+        let KeyChange::Changed { archive, rekeyed } = opened.change_key(&new).unwrap() else {
             panic!("not changed");
         };
         assert_eq!((rekeyed.records, rekeyed.pending), (1, None));
-        assert!(opened.is_files_key(&new) && !opened.is_files_key(&old));
-        assert_eq!(opened.change_key(&new).unwrap(), FilesKeyChange::Unchanged);
-        assert_eq!(opened.archives().unwrap(), std::slice::from_ref(&archive));
+        assert_eq!(opened.encryption_key(), &new);
+        assert_eq!(opened.change_key(&new).unwrap(), KeyChange::Unchanged);
         drop(opened);
 
         // After a restart only the new key opens the folder.
@@ -430,20 +435,16 @@ mod tests {
 
         let mut opened = storage.lock().await.unwrap();
         assert_eq!(
-            opened.roll_back(None, &new).unwrap_err(),
-            RollBackError::WrongKey
+            opened.roll_back(&new, None).unwrap_err(),
+            RollBackError::NoArchiveOpens
         );
         assert_eq!(
-            opened.roll_back(Some("20000101000000"), &old).unwrap_err(),
-            RollBackError::NotFound
+            opened.roll_back(&old, Some("20000101000000")).unwrap_err(),
+            RollBackError::NoSuchArchive
         );
-        let rolled_back = opened.roll_back(None, &old).unwrap();
+        let rolled_back = opened.roll_back(&old, None).unwrap();
         assert_eq!(rolled_back.restored, archive);
-        assert!(opened.is_files_key(&old));
-        assert_eq!(
-            opened.archives().unwrap(),
-            [rolled_back.archive.clone(), archive.clone()]
-        );
+        assert_eq!(opened.encryption_key(), &old);
         drop(opened);
 
         let storage = SecureStorage::new(data.0.clone(), None);
@@ -455,9 +456,9 @@ mod tests {
 
         // The rollback is undone the same way: its archive, with the new key.
         let mut opened = storage.lock().await.unwrap();
-        let undone = opened.roll_back(None, &new).unwrap();
+        let undone = opened.roll_back(&new, None).unwrap();
         assert_eq!(undone.restored, rolled_back.archive);
-        assert!(opened.is_files_key(&new));
+        assert_eq!(opened.encryption_key(), &new);
         let events: Vec<JournalEvent> = opened
             .read_journal(&JournalQuery::default())
             .unwrap()

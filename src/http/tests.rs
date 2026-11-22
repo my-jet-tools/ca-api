@@ -159,10 +159,10 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
     write_legacy_ca(&server.legacy.0, "xfin-ca");
     let (s, t) = (server.socket.as_str(), server.tcp.as_str());
 
-    let files_key_text = encode_key(&generate_key().unwrap());
-    let files_key = HttpBodyEncryptionKey::from_base64(&files_key_text).unwrap();
-    let network_key_text = encode_key(&generate_key().unwrap());
-    let network_key = HttpBodyEncryptionKey::from_base64(&network_key_text).unwrap();
+    let encryption_text = encode_key(&generate_key().unwrap());
+    let encryption = HttpBodyEncryptionKey::from_base64(&encryption_text).unwrap();
+    let network_text = encode_key(&generate_key().unwrap());
+    let network = HttpBodyEncryptionKey::from_base64(&network_text).unwrap();
     let stranger = HttpBodyEncryptionKey::from_base64(&encode_key(&generate_key().unwrap())).unwrap();
 
     // Locked: nothing is served.
@@ -174,9 +174,13 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
         json!({ "initialized": false })
     );
 
-    // The key is taken over the unix socket only, and not from the reverse proxy.
-    let init = json!({ "key": files_key_text });
-    assert_eq!(post_plain(t, "/api/initialize", init.clone()).await.status, 403);
+    // The one plain call: the encryption key is taken over the unix socket only, and not from the
+    // reverse proxy.
+    let init = json!({ "key": encryption_text });
+    assert_eq!(
+        post_plain(t, "/api/initialize", init.clone()).await.status,
+        403
+    );
     let relayed = url(s, "/api/initialize")
         .with_header("X-Forwarded-For", "203.0.113.7")
         .post(HttpRequestBody::as_json(&init))
@@ -193,103 +197,176 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
     assert!(done.get("key").is_none());
     assert_eq!(post_plain(s, "/api/initialize", init).await.status, 409);
 
-    // The lists: encrypted with the files key, over TCP too.
-    let list = get(t, "/api/ca/v1/list", "").await;
-    assert_eq!(list.status, 200);
-    assert!(!String::from_utf8_lossy(&list.body).contains("xfin-ca"));
-    assert_eq!(list.json(&files_key), json!(["xfin-ca"]));
-
-    // A change needs a body encrypted with the files key.
+    // Until a network key is set, the calls it opens answer 409 — under the encryption key too.
     let issue = json!({ "caName": "xfin-ca", "email": "carol@example.com" });
-    assert_eq!(post_plain(t, "/api/certificates/v1/generate", issue.clone()).await.status, 415);
+    assert_eq!(get(t, "/api/ca/v1/list", "").await.status, 409);
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/generate", &stranger, issue.clone()).await.status,
+        post_encrypted(
+            t,
+            "/api/certificates/v1/generate",
+            &encryption,
+            issue.clone()
+        )
+        .await
+        .status,
+        409
+    );
+    // my-reverse-proxy's reads: nothing until a network key is set.
+    assert_eq!(
+        get(t, "/api/ca/v1/downloadCert", "xfin-ca").await.status,
+        503
+    );
+
+    // The network key: set under the encryption key, and never the encryption key itself.
+    let set_network = |key: &str| json!({ "networkKey": key });
+    assert_eq!(
+        post_plain(t, "/api/set-network-key", set_network(&network_text))
+            .await
+            .status,
+        415
+    );
+    assert_eq!(
+        post_encrypted(
+            t,
+            "/api/set-network-key",
+            &stranger,
+            set_network(&network_text)
+        )
+        .await
+        .status,
         400
     );
-    let issued = post_encrypted(s, "/api/certificates/v1/generate", &files_key, issue.clone()).await;
-    assert_eq!(issued.status, 200);
-    // The legacy CA issued serials 1 and 5: the next id is 6.
-    assert_eq!(issued.json(&files_key), json!({ "id": 6, "cn": "carol@example.com" }));
-    assert_eq!(cert_state(t, &files_key, 6).await, Some(false));
-
-    // my-reverse-proxy's reads: nothing until a network key is set — never the files key.
-    assert_eq!(get(t, "/api/ca/v1/downloadCert", "xfin-ca").await.status, 503);
-    let refused = post_encrypted(
-        t,
-        "/api/set-network-key",
-        &files_key,
-        json!({ "networkKey": files_key_text }),
-    )
-    .await;
-    assert_eq!(refused.status, 403);
+    assert_eq!(
+        post_encrypted(
+            t,
+            "/api/set-network-key",
+            &encryption,
+            set_network(&encryption_text)
+        )
+        .await
+        .status,
+        403
+    );
     let set = post_encrypted(
         t,
         "/api/set-network-key",
-        &files_key,
-        json!({ "networkKey": network_key_text }),
+        &encryption,
+        set_network(&network_text),
     )
     .await;
     assert_eq!(
-        set.json(&files_key),
+        set.json(&encryption),
         json!({ "set": true, "replaced": false, "changed": true })
     );
+    // From now on it takes the encryption key alone: the network key opens it no more.
+    assert_eq!(
+        post_encrypted(
+            t,
+            "/api/set-network-key",
+            &network,
+            set_network(&network_text)
+        )
+        .await
+        .status,
+        403
+    );
+
+    // The lists: encrypted with the network key, over TCP too.
+    let list = get(t, "/api/ca/v1/list", "").await;
+    assert_eq!(list.status, 200);
+    assert!(!String::from_utf8_lossy(&list.body).contains("xfin-ca"));
+    assert!(encryption.decrypt(&list.body).is_err());
+    assert_eq!(list.json(&network), json!(["xfin-ca"]));
+
+    // A change needs a body encrypted with the network key: the encryption key opens it no more.
+    assert_eq!(
+        post_plain(t, "/api/certificates/v1/generate", issue.clone())
+            .await
+            .status,
+        415
+    );
+    assert_eq!(
+        post_encrypted(t, "/api/certificates/v1/generate", &stranger, issue.clone())
+            .await
+            .status,
+        400
+    );
+    assert_eq!(
+        post_encrypted(
+            t,
+            "/api/certificates/v1/generate",
+            &encryption,
+            issue.clone()
+        )
+        .await
+        .status,
+        403
+    );
+    let issued = post_encrypted(s, "/api/certificates/v1/generate", &network, issue.clone()).await;
+    assert_eq!(issued.status, 200);
+    // The legacy CA issued serials 1 and 5: the next id is 6.
+    assert_eq!(
+        issued.json(&network),
+        json!({ "id": 6, "cn": "carol@example.com" })
+    );
+    assert_eq!(cert_state(t, &network, 6).await, Some(false));
 
     let ca = get(t, "/api/ca/v1/downloadCert", "xfin-ca").await;
     assert_eq!(ca.status, 200);
     assert_eq!(ca.content_type.as_deref(), Some("application/x-pem-file"));
-    assert!(String::from_utf8(ca.open(&network_key))
+    assert!(String::from_utf8(ca.open(&network))
         .unwrap()
         .contains("BEGIN CERTIFICATE"));
-    assert!(files_key.decrypt(&ca.body).is_err());
+    assert!(encryption.decrypt(&ca.body).is_err());
     assert_eq!(get(t, "/api/ca/v1/downloadCert", "nope").await.status, 404);
 
     // Revoking: encrypted, once. By email: every certificate of it that is not revoked.
     let revoke = json!({ "caName": "xfin-ca", "email": "carol@example.com" });
     assert_eq!(post_plain(t, "/api/certificates/v1/revoke", revoke.clone()).await.status, 415);
-    let revoked = post_encrypted(t, "/api/certificates/v1/revoke", &files_key, revoke.clone()).await;
-    assert_eq!(revoked.json(&files_key), json!({ "revoked": [6] }));
+    let revoked = post_encrypted(t, "/api/certificates/v1/revoke", &network, revoke.clone()).await;
+    assert_eq!(revoked.json(&network), json!({ "revoked": [6] }));
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/revoke", &files_key, revoke).await.status,
+        post_encrypted(t, "/api/certificates/v1/revoke", &network, revoke).await.status,
         404
     );
 
     // Issuing the same email again adds certificates and replaces none: 6 stays revoked, in the CRL.
     for expected in [7, 8] {
-        let again = post_encrypted(t, "/api/certificates/v1/generate", &files_key, issue.clone()).await;
-        assert_eq!(again.json(&files_key)["id"], json!(expected));
+        let again = post_encrypted(t, "/api/certificates/v1/generate", &network, issue.clone()).await;
+        assert_eq!(again.json(&network)["id"], json!(expected));
     }
-    assert_eq!(cert_state(t, &files_key, 6).await, Some(true));
-    assert_eq!(cert_state(t, &files_key, 7).await, Some(false));
+    assert_eq!(cert_state(t, &network, 6).await, Some(true));
+    assert_eq!(cert_state(t, &network, 7).await, Some(false));
     // By id: that one only, once; with an email it must be that email's.
     let by_id = |id: u64| json!({ "caName": "xfin-ca", "id": id });
     let wrong_email = json!({ "caName": "xfin-ca", "id": 7, "email": "bob@example.com" });
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/revoke", &files_key, wrong_email).await.status,
+        post_encrypted(t, "/api/certificates/v1/revoke", &network, wrong_email).await.status,
         404
     );
-    let revoked = post_encrypted(t, "/api/certificates/v1/revoke", &files_key, by_id(7)).await;
-    assert_eq!(revoked.json(&files_key), json!({ "revoked": [7] }));
+    let revoked = post_encrypted(t, "/api/certificates/v1/revoke", &network, by_id(7)).await;
+    assert_eq!(revoked.json(&network), json!({ "revoked": [7] }));
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/revoke", &files_key, by_id(7)).await.status,
+        post_encrypted(t, "/api/certificates/v1/revoke", &network, by_id(7)).await.status,
         409
     );
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/revoke", &files_key, by_id(99)).await.status,
+        post_encrypted(t, "/api/certificates/v1/revoke", &network, by_id(99)).await.status,
         404
     );
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/revoke", &files_key, json!({ "caName": "xfin-ca" }))
+        post_encrypted(t, "/api/certificates/v1/revoke", &network, json!({ "caName": "xfin-ca" }))
             .await
             .status,
         403
     );
-    assert_eq!(cert_state(t, &files_key, 8).await, Some(false));
+    assert_eq!(cert_state(t, &network, 8).await, Some(false));
     // What my-reverse-proxy refuses: a YAML array of the revoked serials, with the network key.
     let revoked_list = get(t, "/api/revoked/v1/list", "xfin-ca").await;
     assert_eq!(revoked_list.status, 200);
     assert_eq!(revoked_list.content_type.as_deref(), Some("application/yaml"));
-    assert!(files_key.decrypt(&revoked_list.body).is_err());
-    let yaml = String::from_utf8(revoked_list.open(&network_key)).unwrap();
+    assert!(encryption.decrypt(&revoked_list.body).is_err());
+    let yaml = String::from_utf8(revoked_list.open(&network)).unwrap();
     // bob's 5, revoked before the import, and carol's 6 and 7.
     assert_eq!(yaml, "- 5\n- 6\n- 7\n");
     assert_eq!(serde_yaml::from_str::<Vec<u64>>(&yaml).unwrap(), [5, 6, 7]);
@@ -305,11 +382,11 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
         (json!({ "caName": "xfin-ca", "email": "carol@example.com", "password": "pw" }), 8u32),
         (json!({ "caName": "xfin-ca", "id": 6, "password": "pw" }), 6),
     ] {
-        let p12 = post_encrypted(t, "/api/certificates/v1/downloadCert", &files_key, body).await;
+        let p12 = post_encrypted(t, "/api/certificates/v1/downloadCert", &network, body).await;
         assert_eq!(p12.status, 200);
         assert_eq!(p12.content_type.as_deref(), Some("application/x-pkcs12"));
         assert!(p12.disposition.is_none());
-        let parsed = openssl::pkcs12::Pkcs12::from_der(&p12.open(&files_key))
+        let parsed = openssl::pkcs12::Pkcs12::from_der(&p12.open(&network))
             .unwrap()
             .parse2("pw")
             .unwrap();
@@ -319,12 +396,12 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
     }
     let mismatch = json!({ "caName": "xfin-ca", "id": 6, "email": "bob@example.com", "password": "pw" });
     assert_eq!(
-        post_encrypted(t, "/api/certificates/v1/downloadCert", &files_key, mismatch).await.status,
+        post_encrypted(t, "/api/certificates/v1/downloadCert", &network, mismatch).await.status,
         404
     );
 
-    let pk = post_encrypted(t, "/api/ca/v1/downloadPk", &files_key, json!({ "caName": "xfin-ca" })).await;
-    assert!(String::from_utf8(pk.open(&files_key)).unwrap().contains("PRIVATE KEY"));
+    let pk = post_encrypted(t, "/api/ca/v1/downloadPk", &network, json!({ "caName": "xfin-ca" })).await;
+    assert!(String::from_utf8(pk.open(&network)).unwrap().contains("PRIVATE KEY"));
 
     // Import: the multipart body, encrypted.
     let other = crate::crypto::build_ca(&crate::pem::PemCertInfo {
@@ -340,19 +417,19 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
         .append_form_data_file("privateKey", "key.pem", "", other.key_pem.as_bytes());
     let imported = read(
         url(t, "/api/ca/v1/import")
-            .encrypted(&files_key)
+            .encrypted(&network)
             .post(HttpRequestBody::from(form))
             .await,
     )
     .await;
     assert!(imported.status < 300, "{}", imported.status);
     assert_eq!(
-        get(t, "/api/ca/v1/list", "").await.json(&files_key),
+        get(t, "/api/ca/v1/list", "").await.json(&network),
         json!(["other-ca", "xfin-ca"])
     );
 
     // The journal: everything, encrypted.
-    let journal = post_encrypted(t, "/api/journal", &files_key, json!({})).await.json(&files_key);
+    let journal = post_encrypted(t, "/api/journal", &network, json!({})).await.json(&network);
     let events: Vec<&str> = journal["records"]
         .as_array()
         .unwrap()
@@ -373,11 +450,11 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
     let of_carol = post_encrypted(
         t,
         "/api/journal",
-        &files_key,
+        &network,
         json!({ "cn": "carol@example.com", "limit": 2 }),
     )
     .await
-    .json(&files_key);
+    .json(&network);
     assert_eq!(of_carol["records"].as_array().unwrap().len(), 2);
     let revocations = journal["records"]
         .as_array()
@@ -399,7 +476,7 @@ async fn whoever_has_no_key_reads_nothing_and_changes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_files_key_is_changed_for_another_and_rolled_back() {
+async fn the_encryption_key_is_changed_for_another_and_rolled_back() {
     let server = start().await;
     write_legacy_ca(&server.legacy.0, "xfin-ca");
     let (s, t) = (server.socket.as_str(), server.tcp.as_str());
@@ -420,19 +497,15 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
             .status,
         200
     );
-    post_encrypted(
-        t,
-        "/api/set-network-key",
-        &old,
-        json!({ "networkKey": network_text }),
-    )
-    .await;
+    let set_network = json!({ "networkKey": network_text });
+    let set = post_encrypted(t, "/api/set-network-key", &old, set_network.clone()).await;
+    assert_eq!(set.status, 200);
     let issue = |email: &str| json!({ "caName": "xfin-ca", "email": email });
     assert_eq!(
         post_encrypted(
             t,
             "/api/certificates/v1/generate",
-            &old,
+            &network,
             issue("carol@example.com")
         )
         .await
@@ -440,15 +513,22 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
         200
     );
 
-    // The call: encrypted with the current key, and never to the network key.
+    // The call: under the current encryption key — not the network key — and never to the
+    // network key.
     let change = |key: &str| json!({ "newKey": key });
-    let path = "/api/change-files-key";
+    let path = "/api/change-key";
     assert_eq!(post_plain(t, path, change(&new_text)).await.status, 415);
     assert_eq!(
         post_encrypted(t, path, &stranger, change(&new_text))
             .await
             .status,
         400
+    );
+    assert_eq!(
+        post_encrypted(t, path, &network, change(&new_text))
+            .await
+            .status,
+        403
     );
     assert_eq!(
         post_encrypted(t, path, &old, change("short")).await.status,
@@ -466,7 +546,7 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
     assert_eq!(same["changed"], json!(false));
     assert!(same["archive"].is_null());
 
-    // The change: the answer with the key the call came with.
+    // The change: the answer under the key the call came with.
     let changed = post_encrypted(t, path, &old, change(&new_text)).await;
     assert_eq!(changed.status, 200);
     let changed = changed.json(&old);
@@ -482,23 +562,27 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
         "{changed}"
     );
 
-    // From now on the old key opens nothing: neither a call nor an answer.
+    // From now on the old encryption key opens nothing, the new one does; the network key is not
+    // touched.
     assert_eq!(
-        post_encrypted(t, "/api/journal", &old, json!({}))
+        post_encrypted(t, "/api/set-network-key", &old, set_network.clone())
             .await
             .status,
         400
     );
-    let list = get(t, "/api/ca/v1/list", "").await;
-    assert!(old.decrypt(&list.body).is_err());
-    assert_eq!(list.json(&new), json!(["xfin-ca"]));
+    let again = post_encrypted(t, "/api/set-network-key", &new, set_network.clone()).await;
+    assert_eq!(again.json(&new)["changed"], json!(false));
+    assert_eq!(
+        get(t, "/api/ca/v1/list", "").await.json(&network),
+        json!(["xfin-ca"])
+    );
     // The journal came along into the snapshot.
-    let journal = post_encrypted(t, "/api/journal", &new, json!({}))
+    let journal = post_encrypted(t, "/api/journal", &network, json!({}))
         .await
-        .json(&new);
+        .json(&network);
     assert_eq!(journal["unreadable"], json!(0));
     let records = journal["records"].as_array().unwrap();
-    assert_eq!(records[0]["event"], json!("files_key_changed"));
+    assert_eq!(records[0]["event"], json!("key_changed"));
     assert_eq!(records[0]["archive"], json!(archive));
     let events: Vec<&str> = records
         .iter()
@@ -512,7 +596,6 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
     ] {
         assert!(events.contains(&event), "{event}: {events:?}");
     }
-    // my-reverse-proxy is not touched: its key is the network key.
     assert!(String::from_utf8(
         get(t, "/api/ca/v1/downloadCert", "xfin-ca")
             .await
@@ -520,27 +603,31 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
     )
     .unwrap()
     .contains("BEGIN CERTIFICATE"));
-    assert_eq!(
-        get(t, "/api/files-key-archives", "").await.json(&new),
-        json!([archive])
-    );
 
     // Done after the change: in the snapshot, not in the archive.
     post_encrypted(
         t,
         "/api/certificates/v1/generate",
-        &new,
+        &network,
         issue("dave@example.com"),
     )
     .await;
-    assert!(emails(t, &new)
+    assert!(emails(t, &network)
         .await
         .contains(&"dave@example.com".to_string()));
 
-    // The rollback: the archive back, with its key — which the archive alone tells.
-    let rollback = "/api/rollback-files-key";
+    // The rollback: under the current encryption key. The archive is opened with the key the body
+    // hands; when it fits, the archive is put back and that key is the encryption key.
+    let rollback = "/api/rollback";
+    let back = |key: &str| json!({ "key": key });
     assert_eq!(
-        post_encrypted(t, rollback, &new, json!({ "key": new_text }))
+        post_encrypted(t, rollback, &network, back(&old_text))
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        post_encrypted(t, rollback, &new, back(&new_text))
             .await
             .status,
         403
@@ -565,55 +652,33 @@ async fn the_files_key_is_changed_for_another_and_rolled_back() {
     .await
     .json(&new);
     assert_eq!(rolled_back["restored"], json!(archive));
+    assert_eq!(rolled_back["network_key"], json!(true));
     let replaced = rolled_back["archive"].as_str().unwrap().to_string();
     assert_ne!(replaced, archive);
-    let after_rollback = emails(t, &old).await;
-    assert!(after_rollback.contains(&"carol@example.com".to_string()));
-    assert!(!after_rollback.contains(&"dave@example.com".to_string()));
     assert_eq!(
-        post_encrypted(t, "/api/journal", &new, json!({}))
+        post_encrypted(t, "/api/set-network-key", &new, set_network.clone())
             .await
             .status,
         400
     );
+    let after_rollback = emails(t, &network).await;
+    assert!(after_rollback.contains(&"carol@example.com".to_string()));
+    assert!(!after_rollback.contains(&"dave@example.com".to_string()));
 
-    // Undone the same way: the newest archive is what the rollback replaced, with the new key.
-    let undone = post_encrypted(t, rollback, &old, json!({ "key": new_text }))
+    // Undone the same way: with none named, the newest archive the key opens — what the rollback
+    // replaced, under the new key.
+    let undone = post_encrypted(t, rollback, &old, back(&new_text))
         .await
         .json(&old);
     assert_eq!(undone["restored"], json!(replaced));
-    assert!(emails(t, &new)
+    assert!(emails(t, &network)
         .await
         .contains(&"dave@example.com".to_string()));
-    let archives = get(t, "/api/files-key-archives", "").await.json(&new);
-    assert_eq!(archives.as_array().unwrap().len(), 3);
-    assert_eq!(archives[2], json!(archive));
-
-    // An archive deleted: its key opens nothing here any more.
-    let delete = "/api/delete-files-key-archive";
-    let deleted = post_encrypted(t, delete, &new, json!({ "archive": archive })).await;
-    assert_eq!(deleted.json(&new), json!({ "deleted": true }));
-    assert_eq!(
-        post_encrypted(t, delete, &new, json!({ "archive": archive }))
-            .await
-            .status,
-        404
-    );
-    assert_eq!(
-        post_encrypted(
-            t,
-            rollback,
-            &new,
-            json!({ "key": old_text, "archive": archive })
-        )
+    let journal = post_encrypted(t, "/api/journal", &network, json!({ "limit": 1 }))
         .await
-        .status,
-        404
-    );
-    let journal = post_encrypted(t, "/api/journal", &new, json!({ "limit": 1 }))
-        .await
-        .json(&new);
-    assert_eq!(journal["records"][0]["event"], json!("archive_deleted"));
+        .json(&network);
+    assert_eq!(journal["records"][0]["event"], json!("rolled_back"));
+    assert_eq!(journal["records"][0]["restored"], json!(replaced));
 
     // On the disk, archives included: nothing readable.
     for entry in walk(&server.data.0) {

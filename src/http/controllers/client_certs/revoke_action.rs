@@ -6,13 +6,13 @@ use serde_json::json;
 
 use crate::app::AppContext;
 use crate::flows::CertSelector;
-use crate::http::encryption::{encrypted, request_files_key};
+use crate::http::encryption::{encrypted, request_network_key};
 
 #[http_route(
     method: "POST",
     route: "/api/certificates/v1/revoke",
     summary: "Revoke certificate",
-    description: "Revoke the certificate `id` — or, with `email` alone, every certificate of the email that is not revoked — and rebuild the CRL. The body comes encrypted with the files key (aes128gcm); the answer {revoked: [ids]} is encrypted with it",
+    description: "Revoke the certificate `id` — or, with `email` alone, every certificate of the email that is not revoked — and rebuild the CRL. The body comes encrypted with the network key (aes128gcm); the answer {revoked: [ids]} is encrypted with it",
     controller: "Client Certificates",
     input_data: "RevokeClientCertInputModel",
     result:[
@@ -37,7 +37,7 @@ async fn handle_request(
     input_data: RevokeClientCertInputModel,
     ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let key = request_files_key(ctx)?;
+    let key = request_network_key(&action.app, ctx)?;
     let (selector, email) = CertSelector::of(input_data.id, input_data.email)?;
     let revoked = crate::flows::revoke_cert(
         &action.app,

@@ -4,14 +4,14 @@ use my_http_server::macros::*;
 use my_http_server::*;
 
 use crate::app::AppContext;
-use crate::http::encryption::{encrypted, request_files_key};
+use crate::http::encryption::{encrypted, request_network_key};
 use crate::storage::journal::JournalQuery;
 
 #[http_route(
     method: "POST",
     route: "/api/journal",
     summary: "Read the journal",
-    description: "What was done, newest first: {records, unreadable}. The body ({} for no filter) comes encrypted with the files key (aes128gcm); the answer is encrypted with it",
+    description: "What was done, newest first: {records, unreadable}. The body ({} for no filter) comes encrypted with the network key (aes128gcm); the answer is encrypted with it",
     controller: "Security",
     input_data: "GetJournalInputModel",
     result:[
@@ -34,7 +34,7 @@ async fn handle_request(
     input_data: GetJournalInputModel,
     ctx: &HttpContext,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let key = request_files_key(ctx)?;
+    let key = request_network_key(&action.app, ctx)?;
     let query = JournalQuery {
         from: input_data.from,
         to: input_data.to,

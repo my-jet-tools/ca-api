@@ -1,8 +1,9 @@
 //! In front of every route:
 //!
-//! - `POST /api/initialize` `{"key"?}` — hands the service its key, once per start. The key goes
-//!   in plain text, so it is taken over the unix socket only, and never from a request the reverse
-//!   proxy relayed (`X-Forwarded-For`): `403` otherwise.
+//! - `POST /api/initialize` `{"key"?}` — hands the service its encryption key, once per start: the
+//!   one call that is not encrypted. The key goes in plain text, so it is taken over the unix
+//!   socket only, and never from a request the reverse proxy relayed (`X-Forwarded-For`): `403`
+//!   otherwise.
 //! - `GET|POST /api/is-initialized` → `{"initialized"}`.
 //! - Until the service has its key, every other `/api/…` call is answered here: `503` for what
 //!   my-reverse-proxy reads (so it keeps what it read last), `409` for the rest.
@@ -11,13 +12,13 @@ use std::sync::Arc;
 
 use my_http_server::hyper::Method;
 use my_http_server::{
-    BodyEncryptionKey, HttpContext, HttpFailResult, HttpOkResult, HttpOutput,
-    HttpResponseHeaders, HttpServerMiddleware, WebContentType,
+    HttpContext, HttpFailResult, HttpOkResult, HttpOutput, HttpResponseHeaders,
+    HttpServerMiddleware, WebContentType,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::app::{AppContext, FILES_KEY_ID};
+use crate::app::AppContext;
 use crate::storage::InitializeError;
 
 /// The routes my-reverse-proxy reads, lower case.
@@ -117,7 +118,7 @@ impl GateMiddleware {
             }
         };
 
-        let (done, key) = match self.app.storage.initialize(body.key.as_deref()).await {
+        let (done, _) = match self.app.storage.initialize(body.key.as_deref()).await {
             Ok(done) => done,
             Err(e @ InitializeError::AlreadyInitialized) => {
                 crate::log::warn(format!("/api/initialize refused: {e}"));
@@ -137,10 +138,10 @@ impl GateMiddleware {
             }
         };
 
-        // From now on my-http-server opens the bodies of the encrypted calls with the files key.
-        match BodyEncryptionKey::from_bytes(FILES_KEY_ID, &key) {
-            Ok(key) => self.app.body_encryption_keys.set(vec![key]),
-            Err(e) => crate::log::warn(format!("The encrypted calls stay closed: {e}")),
+        // From now on my-http-server opens the encrypted calls: the encryption key's, and the
+        // network key's when the state has one.
+        if let Ok(opened) = self.app.storage.lock().await {
+            self.app.refresh_call_keys(&opened);
         }
 
         let how = if done.created {

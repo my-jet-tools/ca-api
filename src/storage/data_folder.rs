@@ -63,16 +63,31 @@ pub enum ArchiveError {
     NotFound,
     /// The key does not open the archive.
     WrongKey,
+    /// None was named, and the key opens none of the archives.
+    NoneOpens,
     Failed(String),
 }
 
 /// An archive the key opened, ready to be put back with [`DataFolder::install`].
 pub struct OpenedArchive {
+    id: String,
     dir: PathBuf,
     /// Its `state.enc`, as it is.
     envelope: String,
     state: StateModel,
     cipher: Cipher,
+}
+
+/// What [`DataFolder::roll_back`] did.
+pub struct RolledBackFolder {
+    /// The state of the archive put back.
+    pub state: StateModel,
+    /// The archive put back.
+    pub restored: String,
+    /// Where what was in place went.
+    pub archive: String,
+    /// Why the journal put back is not in place yet, if it is not.
+    pub pending: Option<String>,
 }
 
 /// Why a key did not open the data folder.
@@ -197,7 +212,7 @@ impl DataFolder {
     }
 
     /// The ids of the archives, newest first.
-    pub fn archives(&self) -> Result<Vec<String>, String> {
+    fn archives(&self) -> Result<Vec<String>, String> {
         let root = self.folder.join(ARCHIVE_DIR);
         let entries = match std::fs::read_dir(&root) {
             Ok(entries) => entries,
@@ -229,6 +244,7 @@ impl DataFolder {
             ArchiveError::Failed(format!("the state {} is invalid: {e}", path.display()))
         })?;
         Ok(OpenedArchive {
+            id: id.to_string(),
             dir,
             envelope,
             state,
@@ -259,14 +275,38 @@ impl DataFolder {
         Ok((archived.state, pending))
     }
 
-    /// Delete the archive `id`: `false` when there is none.
-    pub fn delete_archive(&self, id: &str) -> Result<bool, String> {
-        let Some(dir) = self.archive_dir(id) else {
-            return Ok(false);
+    /// Put the archive `archive` back — with none named, the newest archive `key` opens — after
+    /// archiving what is in place under the key it has. `key` is the key of the folder from then
+    /// on. An error means nothing changed.
+    pub fn roll_back(
+        &mut self,
+        key: &Key,
+        archive: Option<&str>,
+    ) -> Result<RolledBackFolder, ArchiveError> {
+        let archived = match archive {
+            Some(id) => self.open_archive(id, key)?,
+            None => self.newest_archive_opening(key)?,
         };
-        remove_dir_if_exists(&dir)?;
-        sync_dir(&self.folder.join(ARCHIVE_DIR));
-        Ok(true)
+        let restored = archived.id.clone();
+        let archive = self.archive().map_err(ArchiveError::Failed)?;
+        let (state, pending) = self.install(archived).map_err(ArchiveError::Failed)?;
+        Ok(RolledBackFolder {
+            state,
+            restored,
+            archive,
+            pending,
+        })
+    }
+
+    fn newest_archive_opening(&self, key: &Key) -> Result<OpenedArchive, ArchiveError> {
+        for id in self.archives().map_err(ArchiveError::Failed)? {
+            match self.open_archive(&id, key) {
+                Ok(archived) => return Ok(archived),
+                Err(ArchiveError::WrongKey | ArchiveError::NotFound | ArchiveError::NoneOpens) => {}
+                Err(failed @ ArchiveError::Failed(_)) => return Err(failed),
+            }
+        }
+        Err(ArchiveError::NoneOpens)
     }
 
     fn archive_dir(&self, id: &str) -> Option<PathBuf> {
@@ -894,11 +934,50 @@ pub mod tests {
             second == format!("{archive}-2") || second > archive,
             "{second}"
         );
-        assert_eq!(data.archives().unwrap(), [second.clone(), archive.clone()]);
-        assert!(data.delete_archive(&archive).unwrap());
-        assert!(!data.delete_archive(&archive).unwrap());
-        assert!(!data.delete_archive("../journal").unwrap());
-        assert_eq!(data.archives().unwrap(), [second]);
+        assert_eq!(data.archives().unwrap(), [second, archive]);
+    }
+
+    #[test]
+    fn a_rollback_puts_back_the_archive_its_key_opens() {
+        let folder = Folder::new();
+        let (first, second, third) = (
+            generate_key().unwrap(),
+            generate_key().unwrap(),
+            generate_key().unwrap(),
+        );
+        let mut data = DataFolder::create(&folder.0, &first, &state()).unwrap();
+        data.append(&record(OCT)).unwrap();
+        let under_first = data.archive().unwrap();
+        data.rekey(&second, &StateModel::default()).unwrap();
+        data.append(&record(NOV)).unwrap();
+        let under_second = data.archive().unwrap();
+        data.rekey(&third, &StateModel::default()).unwrap();
+
+        assert!(matches!(
+            data.roll_back(&first, Some("20000101000000")),
+            Err(ArchiveError::NotFound)
+        ));
+        assert!(matches!(
+            data.roll_back(&first, Some(&under_second)),
+            Err(ArchiveError::WrongKey)
+        ));
+        assert!(matches!(
+            data.roll_back(&generate_key().unwrap(), None),
+            Err(ArchiveError::NoneOpens)
+        ));
+
+        // None named: the newest archive the key opens — under_first, though under_second is
+        // newer.
+        let rolled = data.roll_back(&first, None).unwrap();
+        assert_eq!(
+            (rolled.restored.as_str(), rolled.state, rolled.pending),
+            (under_first.as_str(), state(), None)
+        );
+        let (unlocked, _) = DataFolder::unlock(&folder.0, &first).unwrap();
+        assert_eq!(journal_ats(&unlocked), (vec![OCT], 0));
+        // What was in place is archived under the key it had: the third.
+        assert!(data.open_archive(&rolled.archive, &third).is_ok());
+        assert!(data.open_archive(&rolled.archive, &first).is_err());
     }
 
     #[test]

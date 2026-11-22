@@ -1,11 +1,12 @@
 //! ca-api: a CA for client certificates — CAs, issuing and revoking, PKCS#12, and the list of
 //! revoked certificates my-reverse-proxy refuses.
 //!
-//! Everything it knows is kept only encrypted, in the data folder, with a key that is never on the
-//! disk: the service starts knowing nothing and is handed the key over its unix socket
-//! (`POST /api/initialize`). Every call is encrypted — the management API with that key, what
-//! my-reverse-proxy reads with the network key — so whoever gets into the machine can read and
-//! change nothing: at most break it.
+//! Everything it knows is kept only encrypted, in the data folder, with the encryption key, which
+//! is never on the disk: the service starts knowing nothing and is handed the key over its unix
+//! socket (`POST /api/initialize`, the one plain call). Every other call is encrypted: setting the
+//! network key and changing the encryption key with the encryption key, everything else — what
+//! my-reverse-proxy reads included — with the network key. So whoever gets into the machine can
+//! read and change nothing: at most break it.
 
 // `Result<HttpOkResult, HttpFailResult>` is my-http-server's own signature for every action.
 #![allow(clippy::result_large_err)]
